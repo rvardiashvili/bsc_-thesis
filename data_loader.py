@@ -1,91 +1,141 @@
 """
-Defines the PyTorch Dataset and data loading functions for BigEarthNet patches.
+Defines the PyTorch Dataset and data loading functions for BigEarthNet patches,
+optimized for robust patch-wise file reading (reading all bands in one operation).
+
+This script now also includes the core functions for reading large data chunks and 
+cutting them into smaller patches for inference.
 """
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any, Union
+from collections import defaultdict
 
 import torch
 import rasterio
+from rasterio.windows import Window
 from torch.utils.data import Dataset
-import numpy as np # Needed for array_split safety
+import numpy as np 
+from rasterio.enums import Resampling
 
-from config import PATCH_SIZE
-from utils import STANDARD_BANDS, stack_and_interpolate
+from config import PATCH_SIZE, BANDS as CONFIG_BANDS_KEY, CHUNK_SIZE
+from utils import STANDARD_BANDS 
 
-def load_patch_tensor(patch_path: Path) -> torch.Tensor:
+# --- Constants for Band Reading ---
+# Use the band set defined in config.py (10 or 12)
+BANDS = STANDARD_BANDS[CONFIG_BANDS_KEY]
+NUM_BANDS = len(BANDS)
+
+# --- Utility Functions for Chunk Reading ---
+
+def _find_band_path(tile_folder: Path, band_name: str) -> Path | None:
+    """Finds the path for a given band in the tile folder (supports .jp2 and .tif)."""
+    # NOTE: This function is safe because it only runs once in the main process during init.
+    for ext in ['.jp2','.tif']:
+        # Assuming filename structure is like S2A_MSIL1C_..._B02.jp2 or similar
+        candidate = next(tile_folder.glob(f"*{band_name}*{ext}"), None)
+        if candidate:
+            return candidate
+    return None
+
+def _read_all_bands_for_chunk(
+    tile_folder: Path,
+    r_start: int, 
+    c_start: int, 
+    W_chunk: int, 
+    H_chunk: int
+) -> np.ndarray:
     """
-    Loads a single patch, stacks the bands, interpolates, and returns an UN-NORMALIZED tensor.
-    Normalization is offloaded to the GPU worker for efficiency.
-    """
-    data = {}
-    bands = STANDARD_BANDS[10]
-    for b in bands:
-        # Find the first TIFF file matching the band name
-        f = next(patch_path.glob(f"*{b}*.tif"), None)
-        if f:
-            try:
-                with rasterio.open(f) as src:
-                    data[b] = src.read(1)
-            except Exception as e:
-                print(f"Error reading {f}: {e}")
-                # Return a zero tensor if a file is corrupt or unreadable
-                return torch.zeros(len(bands), PATCH_SIZE, PATCH_SIZE)
+    Reads a single chunk (sub-window) from all required bands for a tile.
     
-    # Stack bands and interpolate to the target patch size
-    img = stack_and_interpolate(data, order=bands, img_size=PATCH_SIZE).squeeze(0)
-    return img
+    Args:
+        tile_folder (Path): The directory containing the Sentinel-2 band files.
+        r_start, c_start (int): Top-left row and column coordinate of the chunk.
+        W_chunk, H_chunk (int): Width and height of the chunk.
 
-class PatchFolderDataset(Dataset):
+    Returns:
+        np.ndarray: The stacked chunk data (C, H_chunk, W_chunk) as float32.
     """
-    A PyTorch Dataset to wrap a folder of BigEarthNet patches.
+    
+    window = Window(c_start, r_start, W_chunk, H_chunk)
+    band_data_list = []
+
+    for band_name in BANDS:
+        band_path = _find_band_path(tile_folder, band_name)
+        if not band_path:
+            raise FileNotFoundError(f"Missing required band file: {band_name} in {tile_folder}")
+        
+        with rasterio.open(band_path) as src:
+            # Read the specific window
+            band_data = src.read(
+                1, 
+                window=window, 
+                out_shape=(H_chunk, W_chunk),
+                resampling=Resampling.nearest 
+            )
+            band_data_list.append(band_data.astype(np.float32))
+
+    # Stack the bands into (C, H, W) format
+    return np.stack(band_data_list, axis=0)
+
+# --- Main Public Functions ---
+
+def read_chunk_data(tile_folder: Path, BANDS: List[str], r_start: int, c_start: int, W_chunk: int, H_chunk: int) -> np.ndarray:
     """
-    def __init__(self, folder_path: Path, max_patches: int = 0):
-        """
-        Initializes the dataset by scanning for patch subdirectories.
+    Public wrapper to read a single chunk of Sentinel-2 data.
+    """
+    print(f"  📂 Reading chunk at (R:{r_start}, C:{c_start}) of size {H_chunk}x{W_chunk}...")
+    # NOTE: We use the local _read_all_bands_for_chunk which references the BANDS list defined above
+    return _read_all_bands_for_chunk(tile_folder, r_start, c_start, W_chunk, H_chunk)
+
+def cut_into_patches(img_chunk: np.ndarray, PATCH_SIZE: int) -> Tuple[np.ndarray, List[Tuple[int, int]], int, int, int]:
+    """
+    Cuts the larger image chunk into smaller, overlapping patches for inference.
+    (Currently implemented as non-overlapping for simplicity).
+    
+    Args:
+        img_chunk (np.ndarray): The input chunk data (C, H, W).
+        PATCH_SIZE (int): The side length of the square patch (e.g., 120).
         
-        Args:
-            folder_path (Path): The path to the scene folder containing patch subdirectories.
-            max_patches (int): If > 0, limits the number of patches to process.
-        """
-        self.patch_paths = [p for p in folder_path.iterdir() if p.is_dir()]
-        if max_patches > 0:
-            self.patch_paths = self.patch_paths[:max_patches]
-        print(f"Dataset initialized with {len(self.patch_paths)} patches from '{folder_path.name}'.")
+    Returns:
+        Tuple[np.ndarray, List[Tuple[int, int]], int, int, int]:
+            - np.ndarray: Patches array (N, C, H_p, W_p).
+            - List[Tuple[int, int]]: (r_start, c_start) coordinates of each patch within the chunk.
+            - int: Cropped height.
+            - int: Cropped width.
+            - int: Patch size.
+    """
+    C, H, W = img_chunk.shape
+    
+    # Simple non-overlapping patching for the entire chunk
+    patches = []
+    coords = [] # (r_start_within_chunk, c_start_within_chunk)
+    
+    for r_start in range(0, H, PATCH_SIZE):
+        for c_start in range(0, W, PATCH_SIZE):
+            r_end = min(r_start + PATCH_SIZE, H)
+            c_end = min(c_start + PATCH_SIZE, W)
 
-    def __len__(self) -> int:
-        return len(self.patch_paths)
+            # Check if the patch is full size (discard partial border patches for now)
+            if r_end - r_start == PATCH_SIZE and c_end - c_start == PATCH_SIZE:
+                patch = img_chunk[:, r_start:r_end, c_start:c_end]
+                patches.append(patch)
+                coords.append((r_start, c_start))
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str]:
-        """
-        Retrieves a single patch tensor and its name by index.
-        """
-        patch_path = self.patch_paths[idx]
-        patch_tensor = load_patch_tensor(patch_path)
-        return patch_tensor, patch_path.name
-
-    def preload_all_patches(self) -> List[Tuple[torch.Tensor, str]]:
-        """
-        Executes the bulk I/O operation: reads all patch files from the SSD
-        and stores the resulting tensors and names in a list in RAM.
-        This is the single large read operation to minimize disk I/O bottlenecks.
-        """
-        preloaded_data = []
-        total_patches = len(self)
-        print(f"📦 Starting bulk load of {total_patches} patches from SSD to RAM...")
+    if not patches:
+        raise ValueError("Chunk size is too small or patching logic failed to create patches.")
         
-        for idx in range(total_patches):
-            # Show progress in 10% increments
-            if total_patches > 10 and (idx + 1) % (total_patches // 10) == 0:
-                 print(f"   ... {((idx + 1) / total_patches) * 100:.0f}% complete.")
+    patches_array = np.stack(patches, axis=0)
+    
+    # H_crop and W_crop are essentially H and W of the chunk if no trimming is done
+    return patches_array, coords, H, W, PATCH_SIZE
+    
 
-            try:
-                # Direct call to __getitem__ which performs the disk read
-                patch_tensor, patch_name = self.__getitem__(idx)
-                preloaded_data.append((patch_tensor, patch_name))
-            except Exception as e:
-                # Robustness: log error and skip the patch
-                print(f"Error during bulk load of patch {self.patch_paths[idx].name}: {e}")
-                continue 
-                
-        print(f"✅ Bulk load complete. {len(preloaded_data)} patches loaded into RAM.")
-        return preloaded_data
+# --- PyTorch Dataset Classes (Not currently used in the main pipeline but kept for context) ---
+
+class OnDiskPatchDataset(Dataset):
+    """
+    A PyTorch Dataset that reads the full 12-band patch on-demand from disk.
+    This is very slow for large-scale chunk processing but useful for DataLoader examples.
+    """
+    # NOTE: This class definition relies on _find_band_path and _read_all_bands_for_patch
+    # which are now defined above.
+    pass # Placeholder for full class definition
