@@ -18,6 +18,8 @@ from huggingface_hub import PyTorchModelHubMixin
 __author__ = "Leonard Hackel - BIFOLD/RSiM TU Berlin"
 
 
+import warnings
+
 class BigEarthNetv2_0_ImageClassifier(pl.LightningModule, PyTorchModelHubMixin):
     """
     Wrapper around a pytorch module, allowing this module to be used in automatic
@@ -34,12 +36,18 @@ class BigEarthNetv2_0_ImageClassifier(pl.LightningModule, PyTorchModelHubMixin):
             warmup: Optional[int] = None,
     ):
         super().__init__()
+        # If config is a dict (from from_pretrained), convert it to ILMConfiguration
+        if isinstance(config, dict):
+            config = ILMConfiguration(**config)
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, message="Keyword 'img_size' unknown. Trying to ignore and restart creation.")
+            self.model = ConfigILM.ConfigILM(config)
         self.lr = lr
         self.warmup = None if warmup is None or warmup < 0 else warmup
         self.config = config
         assert config.network_type == ILMType.IMAGE_CLASSIFICATION
         assert config.classes == 19
-        self.model = ConfigILM.ConfigILM(config)
         self.val_output_list: List[dict] = []
         self.test_output_list: List[dict] = []
         self.loss = torch.nn.BCEWithLogitsLoss()

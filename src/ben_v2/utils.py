@@ -14,14 +14,14 @@ from PIL import Image # Required for saving PNG preview
 from scipy.ndimage import zoom # Required for downscaling the mask
 from torch.utils.data import DataLoader
 
-from config import (
+from .config import (
     DEVICE, PATCH_SIZE, BANDS, RGB_INDICES, SAVE_PREVIEW_IMAGE, 
     PREVIEW_DOWNSCALE_FACTOR, GPU_BATCH_SIZE, USE_AMP, autocast, 
     NORM_M, NORM_S
 )
 
 # ----------------------------------------------------------------------
-# --- Placeholder/Required Module Variables ---\
+# --- Placeholder/Required Module Variables ---
 # These are initialized to ensure module-level existence for imports.
 # ----------------------------------------------------------------------
 
@@ -31,13 +31,13 @@ BigEarthNetv2_0_ImageClassifier = None
 FALLBACK_LABEL_KEY = 'No_Dominant_Class' 
 
 # ----------------------------------------------------------------------
-# --- Placeholder Logic for Missing Libraries ---\
+# --- Placeholder Logic for Missing Libraries ---
 # ----------------------------------------------------------------------
 
 try:
     # Attempt to import the real libraries
     from configilm.extra.BENv2_utils import STANDARD_BANDS, NEW_LABELS, stack_and_interpolate, means, stds
-    from BigEarthNetv2_0_ImageClassifier import BigEarthNetv2_0_ImageClassifier
+    from .model import BigEarthNetv2_0_ImageClassifier
     print("✅ Successfully loaded BENv2 libraries.")
     
 except ImportError as e:
@@ -176,7 +176,6 @@ def run_gpu_inference(patches: np.ndarray, model: torch.nn.Module) -> np.ndarray
     Returns:
         np.ndarray: Concatenated array of sigmoid probabilities (N_patches, N_classes).
     """
-    print(f"  🚀 Starting GPU inference for {len(patches)} patches...")
     start_time = time.time()
     all_probs = []
     
@@ -211,7 +210,7 @@ def run_gpu_inference(patches: np.ndarray, model: torch.nn.Module) -> np.ndarray
                 logits = model(tensor_gpu)
                 
             # Calculate probabilities and move back to CPU
-            probs = torch.sigmoid(logits.float()).cpu().numpy()
+            probs = torch.sigmoid(logits.float()).cpu().detach().numpy()
             all_probs.append(probs)
         except Exception as e:
             print(f"❌ GPU inference error on batch: {e}")
@@ -220,5 +219,4 @@ def run_gpu_inference(patches: np.ndarray, model: torch.nn.Module) -> np.ndarray
             all_probs.append(probs)
 
     end_time = time.time()
-    print(f"  ✅ GPU inference complete in {end_time - start_time:.2f}s.")
     return np.concatenate(all_probs, axis=0)

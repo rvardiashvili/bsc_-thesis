@@ -6,12 +6,13 @@ segmentator.py for a single, user-specified Sentinel-2 tile folder.
 """
 import time
 from pathlib import Path
+import argparse
 
-import config
-# Import the scalable main function from the refactored segmentator
-from segmentator import main as segmentator_main 
+from . import config
+from .process import main as segmentator_main
+from . import extra_generators
 
-def main():
+def main(TILE_FOLDER: str, OUTPUT_FOLDER: str):
     """
     Orchestrates the scalable analysis of a single input scene.
     """
@@ -19,14 +20,8 @@ def main():
 
     start_time = time.time()
     
-    # =========================================================================
-    # USER INPUT: Define the single directory containing the Sentinel-2 tile bands
-    # NOTE: This path MUST point to the folder containing B02.jp2, B03.jp2, etc.
-    # Replace the example path with your actual data directory.
-    # =========================================================================
-    
-    tile_path = Path(config.TILE_FOLDER)
-    output_path = Path(config.OUTPUT_FOLDER)
+    tile_path = Path(TILE_FOLDER)
+    output_path = Path(OUTPUT_FOLDER)
 
     if not tile_path.is_dir():
         print(f"❌ Error: Input directory '{TILE_FOLDER}' not found or is not a directory.")
@@ -39,7 +34,7 @@ def main():
     print(f"=======================================================")
     
     # The segmentator_main function handles all I/O, chunking, inference, and saving.
-    segmentator_main(tile_folder=str(tile_path), output_directory=str(output_path))
+    segmentator_main(tile_folder=str(tile_path), output_directory=str(output_path), extra_data_generators=[extra_generators.calculate_ndvi])
 
     total_time = time.time() - start_time
 
@@ -47,5 +42,9 @@ def main():
     print(f"Total Wall Time: {total_time:.2f} seconds")
 
 if __name__ == "__main__":
-    # This is the standard entry point when the script is run directly
-    main()
+    parser = argparse.ArgumentParser(description='Run BigEarthNetv2.0 segmentation pipeline.')
+    parser.add_argument('--tile_folder', type=str, required=True, help='Path to the Sentinel-2 tile folder.')
+    parser.add_argument('--output_folder', type=str, required=True, help='Path to the output folder.')
+    args = parser.parse_args()
+
+    main(args.tile_folder, args.output_folder)

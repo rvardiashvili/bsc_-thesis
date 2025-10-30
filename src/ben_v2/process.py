@@ -5,19 +5,20 @@ from pathlib import Path
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from typing import Tuple, List
-from config import (
+from collections.abc import Callable
+from .config import (
     PATCH_SIZE, REPO_ID, DEVICE, GPU_BATCH_SIZE, USE_AMP, autocast, 
     CONFIDENCE_THRESHOLD, CHUNK_SIZE, BANDS, SAVE_FULL_PROBS, SAVE_PREVIEW_IMAGE, PREVIEW_DOWNSCALE_FACTOR
 )
-from utils import (
+from .utils import (
     NEW_LABELS, LABEL_COLOR_MAP, BigEarthNetv2_0_ImageClassifier,
-    NORM_M, NORM_S, STANDARD_BANDS, save_color_mask_preview
+    NORM_M, NORM_S, STANDARD_BANDS, save_color_mask_preview, run_gpu_inference
 )
+from .data import read_chunk_data, cut_into_patches
 
 # ------------------------------------------------------------
 # Setup
 # ------------------------------------------------------------
-BANDS = STANDARD_BANDS[BANDS]
 FALLBACK_LABEL = "No_Dominant_Class"
 LABEL_COLOR_MAP[FALLBACK_LABEL] = np.array([128,128,128],dtype=np.uint8)
 
@@ -34,97 +35,6 @@ def _find_band_path(tile_folder: Path, band_name: str) -> Path | None:
         if candidate:
             return candidate
     return None
-
-# ------------------------------------------------------------
-def load_bands_in_window(tile_folder: Path, window: Window, out_shape: Tuple[int, int],
-                         full_tile_shape: Tuple[int, int], r_start: int, c_start: int,
-                         bands_to_load: List[str] = BANDS) -> np.ndarray:
-    band_paths = [_find_band_path(tile_folder, band) for band in bands_to_load]
-    bands_data = []
-    H_full, W_full = full_tile_shape
-    ref_band_path = _find_band_path(tile_folder, 'B02')
-    if not ref_band_path:
-        return np.array([])
-
-    for i, (band_name, band_path) in enumerate(zip(bands_to_load, band_paths)):
-        if band_path is None:
-            bands_data.append(np.zeros(out_shape, dtype=np.float32))
-            continue
-        try:
-            with rasterio.open(band_path) as src:
-                nodata_value = src.nodata
-                src_W = src.width
-                ratio = src_W / W_full if W_full > 0 else 1.0
-                band_window = (Window(int(round(window.col_off * ratio)),
-                                      int(round(window.row_off * ratio)),
-                                      int(round(window.width * ratio)),
-                                      int(round(window.height * ratio)))
-                               if abs(ratio - 1.0) > 1e-4 else window)
-                data = src.read(1, window=band_window, out_shape=out_shape, resampling=Resampling.nearest)
-                if data is None:
-                    bands_data.append(np.zeros(out_shape, dtype=np.float32))
-                    continue
-                data_2d = np.asarray(data, dtype=np.float32)
-                if nodata_value is not None:
-                    data_2d[data_2d == nodata_value] = 0.0
-                bands_data.append(data_2d)
-        except Exception as e:
-            print(f"Warning: failed reading {band_name} in {tile_folder}: {e}", file=sys.stderr)
-            bands_data.append(np.zeros(out_shape, dtype=np.float32))
-    if not bands_data:
-        return np.array([])
-    return np.stack(bands_data, axis=-1)
-
-# ------------------------------------------------------------
-def cut_into_patches(img: np.ndarray, patch_size:int):
-    H_full, W_full, C = img.shape
-    stride = patch_size // 2
-    r_coords = list(range(0, H_full - stride + 1, stride))
-    c_coords = list(range(0, W_full - stride + 1, stride))
-    if r_coords and (r_coords[-1] + patch_size < H_full):
-        r_coords.append(H_full - patch_size)
-    if c_coords and (c_coords[-1] + patch_size < W_full):
-        c_coords.append(W_full - patch_size)
-    r_coords = sorted(set(r for r in r_coords if 0 <= r and r + patch_size <= H_full))
-    c_coords = sorted(set(c for c in c_coords if 0 <= c and c + patch_size <= W_full))
-    patches_list, coords = [], []
-    for r0 in r_coords:
-        for c0 in c_coords:
-            patch = img[r0:r0+patch_size, c0:c0+patch_size, :]
-            patches_list.append(patch)
-            coords.append((r0, c0))
-    if not patches_list:
-        return torch.empty(0), [], H_full, W_full, img
-    patches_tensor = torch.as_tensor(np.stack(patches_list)).permute(0,3,1,2).float()
-    return patches_tensor, coords, H_full, W_full, img
-
-# ------------------------------------------------------------
-def run_gpu_inference(patches_tensor: torch.Tensor, model: torch.nn.Module) -> np.ndarray:
-    if patches_tensor.numel() == 0:
-        return np.zeros((0, len(NEW_LABELS)), dtype=np.float32)
-    dataset = torch.utils.data.TensorDataset(patches_tensor)
-    loader = DataLoader(dataset, batch_size=GPU_BATCH_SIZE, shuffle=False, num_workers=0)
-    all_probs = []
-    norm_m_device = NORM_M.to(DEVICE)
-    norm_s_device = NORM_S.to(DEVICE)
-    for batch in loader:
-        tensor_cpu = batch[0]
-        tensor_gpu = (tensor_cpu.to(DEVICE) - norm_m_device) / norm_s_device
-        with torch.no_grad(), torch.inference_mode():
-            try:
-                if USE_AMP:
-                    with autocast(dtype=torch.float16):
-                        logits = model(tensor_gpu)
-                else:
-                    logits = model(tensor_gpu)
-                probs = torch.sigmoid(logits.float()).cpu().numpy()
-            except Exception as e:
-                print(f"GPU inference error: {e}", file=sys.stderr)
-                probs = np.zeros((tensor_cpu.shape[0], len(NEW_LABELS)), dtype=np.float32)
-        all_probs.append(probs)
-    if not all_probs:
-        return np.zeros((0, len(NEW_LABELS)), dtype=np.float32)
-    return np.concatenate(all_probs, axis=0)
 
 # ------------------------------------------------------------
 def accumulate_probs(results: np.ndarray, coords: List[Tuple[int, int]], H: int, W: int, patch_size: int, n_classes: int) -> np.ndarray:
@@ -144,7 +54,7 @@ def accumulate_probs(results: np.ndarray, coords: List[Tuple[int, int]], H: int,
     return avg
 
 # ------------------------------------------------------------
-def main(tile_folder: str, crop_limit=None, output_directory: str | None = None):
+def main(tile_folder: str, crop_limit=None, output_directory: str | None = None, extra_data_generators: List[Callable] | None = None):
     t0 = time.time()
     tile = Path(tile_folder)
     # Ensure output_directory is used correctly
@@ -215,8 +125,22 @@ def main(tile_folder: str, crop_limit=None, output_directory: str | None = None)
     out_entropy_path = out_path / f"{tile.name}_entropy.tif"
     out_gap_path = out_path / f"{tile.name}_gap.tif"
 
+    # Create a detailed class map with labels, indices, and colors
+    class_map_data = {
+        label: {
+            "index": i,
+            "color_rgb": LABEL_COLOR_MAP[label].tolist()
+        }
+        for i, label in enumerate(NEW_LABELS)
+    }
+    # Also add the fallback label for completeness
+    class_map_data[FALLBACK_LABEL] = {
+        "index": 255, # Using 255 as it's the nodata value for the mask
+        "color_rgb": LABEL_COLOR_MAP[FALLBACK_LABEL].tolist()
+    }
+
     with open(out_path / f"{tile.name}_classmap.json", "w") as f:
-        json.dump({i: lbl for i, lbl in enumerate(NEW_LABELS)}, f)
+        json.dump(class_map_data, f, indent=2)
 
     model = BigEarthNetv2_0_ImageClassifier.from_pretrained(REPO_ID).to(DEVICE).eval()
 
@@ -226,7 +150,7 @@ def main(tile_folder: str, crop_limit=None, output_directory: str | None = None)
     mosaic_pbar = tqdm(total=total_chunks, desc="Writing", position=1)
     fetch_pbar  = tqdm(total=total_chunks, desc="Inference", position=0)
 
-    def mosaicking_worker(dst_class, dst_conf=None, dst_probs=None, dst_entropy=None, dst_gap=None):
+    def mosaicking_worker(dst_class, dst_conf=None, dst_probs=None, dst_entropy=None, dst_gap=None, extra_data_generators=None):
         try:
             while True:
                 item = result_queue.get()
@@ -261,6 +185,13 @@ def main(tile_folder: str, crop_limit=None, output_directory: str | None = None)
                     if dst_probs is not None:
                         # Write all probability bands (n_classes bands)
                         dst_probs.write(avg.transpose(2,0,1), window=window_cropped)
+
+                    if extra_data_generators:
+                        for generator_func in extra_data_generators:
+                            extra_data = generator_func(probabilities=avg, NEW_LABELS=NEW_LABELS)
+                            out_extra_path = out_path / f"{tile.name}_{generator_func.__name__}.tif"
+                            with rasterio.open(out_extra_path, "w", **profile_float) as dst_extra:
+                                dst_extra.write(extra_data[np.newaxis,:,:], window=window_cropped)
                         
                 except Exception as e:
                     print(f"Error in worker: {e}", file=sys.stderr)
@@ -290,7 +221,7 @@ def main(tile_folder: str, crop_limit=None, output_directory: str | None = None)
 
         worker_thread = threading.Thread(
             target=mosaicking_worker,
-            args=(dst_class, dst_conf, dst_probs, dst_entropy, dst_gap),
+            args=(dst_class, dst_conf, dst_probs, dst_entropy, dst_gap, extra_data_generators),
             daemon=True
         )
         worker_thread.start()
@@ -300,8 +231,8 @@ def main(tile_folder: str, crop_limit=None, output_directory: str | None = None)
                 r_end = min(r_start + CHUNK_SIZE, H_full)
                 c_end = min(c_start + CHUNK_SIZE, W_full)
                 H_chunk, W_chunk = r_end - r_start, c_end - c_start
-                window = Window(c_start, r_start, W_chunk, H_chunk)
-                img_chunk = load_bands_in_window(tile, window, (H_chunk, W_chunk), full_tile_shape, r_start, c_start, BANDS)
+                
+                img_chunk = read_chunk_data(tile, BANDS, r_start, c_start, W_chunk, H_chunk)
                 
                 # Check for empty/nodata chunk
                 if img_chunk.size == 0 or np.mean(img_chunk < 1.0) > 0.99:
@@ -337,6 +268,28 @@ def main(tile_folder: str, crop_limit=None, output_directory: str | None = None)
         if dst_gap: dst_gap.close()
         if dst_probs: dst_probs.close()
         fetch_pbar.close(); mosaic_pbar.close()
+
+    print(f"\n✅ Finished in {time.time()-t0:.2f}s")
+    print(f"Class map: {out_class_path}")
+    print(f"Max prob:  {out_conf_path}")
+    if SAVE_ENTROPY: print(f"Entropy:  {out_entropy_path}")
+    if SAVE_GAP: print(f"Gap:       {out_gap_path}")
+    if SAVE_FULL_PROBS: print(f"Full probs: {out_prob_path}")
+    if SAVE_PREVIEW_IMAGE:
+        # Need to re-open the file as it was closed in the worker thread
+        try:
+            with rasterio.open(out_class_path) as src:
+                class_mask = src.read(1)
+                # Calling the new, correctly imported function
+                save_color_mask_preview(
+                    class_mask, 
+                    out_path / "preview.png", 
+                    downscale_factor=PREVIEW_DOWNSCALE_FACTOR
+                )
+        except Exception as e:
+            print(f"❌ Error during final preview generation: {e}")
+
+    fetch_pbar.close(); mosaic_pbar.close()
 
     print(f"\n✅ Finished in {time.time()-t0:.2f}s")
     print(f"Class map: {out_class_path}")
