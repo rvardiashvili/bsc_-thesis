@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ben_v2"
+version = "0.1.0"
+description = "A scalable pipeline for BigEarthNet v2.0 analysis."
+authors = [{name = "Your Name", email = "you@example.com"}]
+license = {file = "LICENSE"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/your-username/BigEarthNetv2.0"
+
+[tool.setuptools.packages.find]
+where = ["src"]
