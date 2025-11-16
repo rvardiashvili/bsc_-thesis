@@ -109,35 +109,82 @@ From the final, aggregated probability map for each chunk, a suite of geospatial
 
 All GeoTIFF outputs are created with tiling and LZW compression to optimize for storage and read performance.
 
-## 3. Implementation Details
+### 3.1. Asynchronous Processing & Performance
 
-### 3.1. Asynchronous Processing
+
 
 To improve throughput, the pipeline uses a multi-threaded, producer-consumer architecture.
 
+
+
 -   **Producer Thread:** The main thread reads the input data, creates chunks and patches, and performs the GPU-intensive model inference. It places the results (patch probabilities) into a queue.
+
 -   **Consumer Thread (Mosaicking Worker):** A separate worker thread retrieves the results from the queue, performs the probability aggregation, calculates the output products, and writes the final chunk-level rasters to disk.
+
+
 
 This design allows the GPU to be kept busy with inference while the CPU-bound aggregation and I/O operations happen in parallel.
 
-### 3.2. Configuration
+
+
+A key performance optimization is the pre-calculation of the sinusoidal weighting masks used for smoothing. Instead of being wastefully regenerated for every processed chunk, these masks are created once at the beginning of the pipeline and reused, significantly reducing computational overhead.
+
+
+
+### 3.2. Benchmark Mode and Viewer
+
+
+
+The pipeline includes a benchmark mode to facilitate performance testing and analysis across multiple tiles. When run with the `--benchmark` flag, the script will:
+
+1.  Iterate through all tile subdirectories in a given input directory.
+
+2.  Process each tile sequentially, reusing the loaded model to avoid repeated setup costs.
+
+3.  Record performance metrics for each tile, such as processing time, memory usage, and I/O sizes.
+
+4.  Compile the results into a `benchmark_report.csv` file in the main output directory.
+
+5.  Automatically generate an interactive `viewer.html` file that displays the benchmark report in a sortable table and shows a preview of each processed tile along with its color legend.
+
+
+
+### 3.3. Configuration
+
+
 
 The pipeline is highly configurable via the `src/ben_v2/config.py` file. Key parameters include:
 
+
+
 -   `REPO_ID`: The Hugging Face Hub repository ID for the pre-trained model.
+
 -   `CHUNK_SIZE`: The side dimension of a processing chunk.
+
 -   `PATCH_SIZE`: The side dimension of a model input patch.
+
 -   `GPU_BATCH_SIZE`: The number of patches in a batch for GPU inference.
+
 -   `MODEL_NAME`: The name of the pre-trained model, used to dynamically load model-specific configurations (bands, means, stds).
+
 -   `DEVICE`: The target device for computation (`"cuda"` or `"cpu"`).
+
 -   `BANDS`: The list of Sentinel-2 bands to be used, dynamically determined by `MODEL_NAME`.
+
+
 
 ## 4. Future Work and Potential Enhancements
 
 This pipeline provides a robust foundation for large-scale land cover classification. Several avenues for future work exist:
 
+
+
 -   **Distributed Computing:** For processing massive collections of tiles, the pipeline could be integrated with a distributed computing framework like Dask or Apache Spark to parallelize processing across multiple nodes in a cluster.
+
 -   **Alternative Model Architectures:** The `configilm` framework allows for experimentation with different model backbones (e.g., Vision Transformers, ConvNeXt) which may yield improved accuracy.
+
 -   **Uncertainty Quantification:** The existing entropy and gap metrics could be supplemented with more advanced uncertainty quantification techniques, such as Monte Carlo dropout, to provide more reliable estimates of model uncertainty.
+
 -   **Data Fusion:** The pipeline could be extended to incorporate data from other sensors (e.g., Sentinel-1 SAR data) to improve classification accuracy, particularly in areas with persistent cloud cover.
+
 -   **Active Learning:** The uncertainty maps could be used to guide an active learning workflow, where the model requests human annotation for the most uncertain areas to improve its performance over time.
